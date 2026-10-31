@@ -56,30 +56,11 @@ public class PipeClient : IDisposable
         // Send request
         var json = JsonSerializer.Serialize(request, request.GetType(), JsonOptions);
         var payload = System.Text.Encoding.UTF8.GetBytes(json);
-        var lengthPrefix = BitConverter.GetBytes(payload.Length);
-
-        await _pipe!.WriteAsync(lengthPrefix, ct);
-        await _pipe.WriteAsync(payload, ct);
-        await _pipe.FlushAsync(ct);
+        await PipeFraming.WriteMessageAsync(_pipe!, payload, ct);
 
         // Read response
-        var lengthBuffer = new byte[4];
-        int read = await _pipe.ReadAsync(lengthBuffer.AsMemory(0, 4), ct);
-        if (read < 4)
-            throw new IOException("Failed to read response length from pipe");
-
-        int responseLength = BitConverter.ToInt32(lengthBuffer, 0);
-        if (responseLength <= 0 || responseLength > 10 * 1024 * 1024)
-            throw new IOException($"Invalid response length: {responseLength}");
-
-        var responseBuffer = new byte[responseLength];
-        int totalRead = 0;
-        while (totalRead < responseLength)
-        {
-            read = await _pipe.ReadAsync(responseBuffer.AsMemory(totalRead, responseLength - totalRead), ct);
-            if (read == 0) throw new IOException("Pipe closed while reading response");
-            totalRead += read;
-        }
+        var responseBuffer = await PipeFraming.ReadMessageAsync(_pipe!, ct)
+            ?? throw new IOException("Service closed the pipe before sending a response");
 
         var responseJson = System.Text.Encoding.UTF8.GetString(responseBuffer);
         var response = JsonSerializer.Deserialize<TResponse>(responseJson, JsonOptions);

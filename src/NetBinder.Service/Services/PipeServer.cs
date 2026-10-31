@@ -119,23 +119,12 @@ public class PipeServer : IDisposable
         {
             while (pipe.IsConnected && !ct.IsCancellationRequested)
             {
-                Console.WriteLine("[PipeServer] Waiting for request length...");
-                var lengthBuffer = new byte[4];
-                int read = await pipe.ReadAsync(lengthBuffer.AsMemory(0, 4), ct);
-                Console.WriteLine($"[PipeServer] Read length bytes: {read}");
-                if (read < 4) break;
-
-                int payloadLength = BitConverter.ToInt32(lengthBuffer, 0);
-                Console.WriteLine($"[PipeServer] Payload length: {payloadLength}");
-                if (payloadLength <= 0 || payloadLength > 10 * 1024 * 1024) break;
-
-                var payloadBuffer = new byte[payloadLength];
-                read = await pipe.ReadAsync(payloadBuffer.AsMemory(0, payloadLength), ct);
-                Console.WriteLine($"[PipeServer] Read payload bytes: {read}/{payloadLength}");
-                if (read < payloadLength) break;
+                Console.WriteLine("[PipeServer] Waiting for request...");
+                var payloadBuffer = await PipeFraming.ReadMessageAsync(pipe, ct);
+                if (payloadBuffer == null) break;
 
                 string json = System.Text.Encoding.UTF8.GetString(payloadBuffer);
-                Console.WriteLine($"[PipeServer] Received JSON: {json[..Math.Min(json.Length, 200)]}");
+                Console.WriteLine($"[PipeServer] Received {payloadBuffer.Length} bytes: {json[..Math.Min(json.Length, 200)]}");
 
                 // Peek at the "type" field to determine the concrete request class.
                 // PipeRequest is abstract, so System.Text.Json cannot instantiate it directly.
@@ -354,14 +343,20 @@ public class PipeServer : IDisposable
         if (req == null)
             return new GenericResponse { Success = false, Error = "Invalid SetMetric request" };
 
+        var adapter = NativeInterop.IphlpApiWrapper.GetNetworkAdapters()
+            .FirstOrDefault(a => a.InterfaceIndex == req.InterfaceIndex);
+        if (adapter == null)
+            return new GenericResponse { Success = false, Error = $"Network interface {req.InterfaceIndex} was not found" };
+
+        // Preserve the system metric from before the first override. Subsequent edits
+        // must not replace it with the already-customized metric.
+        var existingOverride = _configManager.Config.MetricOverrides
+            .FirstOrDefault(m => m.InterfaceIndex == req.InterfaceIndex);
+        uint originalMetric = existingOverride?.OriginalMetric ?? adapter.InterfaceMetric;
         bool success = NativeInterop.IphlpApiWrapper.SetInterfaceMetric(req.InterfaceIndex, req.Metric);
         if (success)
         {
-            var adapters = NativeInterop.IphlpApiWrapper.GetNetworkAdapters();
-            var adapter = adapters.FirstOrDefault(a => a.InterfaceIndex == req.InterfaceIndex);
-            string name = adapter?.FriendlyName ?? $"Interface {req.InterfaceIndex}";
-            uint originalMetric = adapter?.InterfaceMetric ?? 0;
-            _configManager.SetMetricOverride(req.InterfaceIndex, name, originalMetric, req.Metric);
+            _configManager.SetMetricOverride(req.InterfaceIndex, adapter.FriendlyName, originalMetric, req.Metric);
         }
 
         return new GenericResponse { Success = success, Error = success ? null : "Failed to set interface metric" };
@@ -375,13 +370,14 @@ public class PipeServer : IDisposable
 
         var metricOverride = _configManager.Config.MetricOverrides
             .FirstOrDefault(m => m.InterfaceIndex == req.InterfaceIndex);
-        if (metricOverride != null)
-        {
-            NativeInterop.IphlpApiWrapper.SetInterfaceMetric(req.InterfaceIndex, metricOverride.OriginalMetric);
-            _configManager.ResetMetricOverride(req.InterfaceIndex);
-        }
+        if (metricOverride == null)
+            return new GenericResponse { Success = false, Error = "No metric override exists for this interface" };
 
-        return new GenericResponse { Success = true };
+        bool success = NativeInterop.IphlpApiWrapper.SetInterfaceMetric(req.InterfaceIndex, metricOverride.OriginalMetric);
+        if (success)
+            _configManager.ResetMetricOverride(req.InterfaceIndex);
+
+        return new GenericResponse { Success = success, Error = success ? null : "Failed to restore the original interface metric" };
     }
 
     private GetProxyInfoResponse HandleGetProxyInfo()
@@ -453,11 +449,7 @@ public class PipeServer : IDisposable
     {
         var json = JsonSerializer.Serialize(response, response.GetType(), JsonOptions);
         var payload = System.Text.Encoding.UTF8.GetBytes(json);
-        var lengthPrefix = BitConverter.GetBytes(payload.Length);
-
-        await pipe.WriteAsync(lengthPrefix, ct);
-        await pipe.WriteAsync(payload, ct);
-        await pipe.FlushAsync(ct);
+        await PipeFraming.WriteMessageAsync(pipe, payload, ct);
     }
 
     public void Dispose()

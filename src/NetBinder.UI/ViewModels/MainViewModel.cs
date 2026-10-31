@@ -280,6 +280,41 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     }
 
     // Auto-Connect Loop
+    private readonly ServiceProcessLauncher _serviceLauncher = new();
+    private DateTime _lastServiceStartAttemptUtc = DateTime.MinValue;
+    private static readonly TimeSpan ServiceStartAttemptInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Launches the background service when the UI cannot reach it, so the user only
+    /// has to start the UI. Retried at most every ten seconds so a broken or missing
+    /// executable cannot spawn a new process on every poll.
+    /// </summary>
+    private async Task<bool> TryStartServiceAsync()
+    {
+        if (ServiceProcessLauncher.IsServiceRunning())
+        {
+            return false;
+        }
+
+        if (DateTime.UtcNow - _lastServiceStartAttemptUtc < ServiceStartAttemptInterval)
+        {
+            return false;
+        }
+
+        _lastServiceStartAttemptUtc = DateTime.UtcNow;
+        StatusMessage = "Starting NetBinder Service...";
+
+        bool connected = await _serviceLauncher.EnsureStartedAsync(_pipeClient, TimeSpan.FromSeconds(8));
+        if (!connected && _serviceLauncher.LastError != null)
+        {
+            // Surface the reason instead of leaving a generic "not reachable" message:
+            // a UI-only failure here is almost always a missing or non-startable service exe.
+            StatusMessage = _serviceLauncher.LastError;
+        }
+
+        return true;
+    }
+
     private async Task AutoConnectLoopAsync()
     {
         while (true)
@@ -288,6 +323,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             {
                 try
                 {
+                    await TryStartServiceAsync();
+
                     await _pipeClient.ConnectAsync();
                     IsConnected = true;
                     StatusMessage = "Connected to NetBinder Service.";
@@ -310,6 +347,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             IsLoading = true;
             StatusMessage = "Connecting...";
+
+            // A manual reconnect should not wait out the automatic retry window.
+            _lastServiceStartAttemptUtc = DateTime.MinValue;
+            await TryStartServiceAsync();
+
             await _pipeClient.ConnectAsync();
             IsConnected = true;
             StatusMessage = "Connected to NetBinder Service.";

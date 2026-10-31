@@ -56,7 +56,21 @@ public class ConfigManager
         }
         catch (Exception ex)
         {
-            // If config is corrupt, start fresh
+            // Preserve a potentially recoverable config before starting with defaults.
+            try
+            {
+                if (File.Exists(ConfigFilePath))
+                {
+                    string backupPath = ConfigFilePath + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmssfff}";
+                    File.Copy(ConfigFilePath, backupPath, overwrite: false);
+                    Console.WriteLine($"[ConfigManager] Preserved unreadable config at {backupPath}");
+                }
+            }
+            catch (Exception backupException)
+            {
+                Console.WriteLine($"[ConfigManager] Could not preserve unreadable config: {backupException.Message}");
+            }
+
             _config = new NetBinderConfig();
             Console.WriteLine($"[ConfigManager] Failed to load config: {ex.Message}");
         }
@@ -72,7 +86,19 @@ public class ConfigManager
             Directory.CreateDirectory(ConfigDirectory);
             _config.LastModified = DateTime.UtcNow;
             var json = JsonSerializer.Serialize(_config, JsonOptions);
-            File.WriteAllText(ConfigFilePath, json);
+            string tempPath = ConfigFilePath + $".{Guid.NewGuid():N}.tmp";
+            try
+            {
+                File.WriteAllText(tempPath, json);
+                // Keep the temporary file in the same directory so replacement stays
+                // on the same volume and the live config is never partially written.
+                File.Move(tempPath, ConfigFilePath, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(tempPath))
+                    File.Delete(tempPath);
+            }
         }
         catch (Exception ex)
         {
