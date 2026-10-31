@@ -453,30 +453,65 @@ public class Socks5ProxyManager : IDisposable
             return existing;
         }
 
-        // Determine port
-        int port;
-        if (preferredPort.HasValue && preferredPort.Value >= BasePort && preferredPort.Value < BasePort + MaxProxies)
+        // Try the remembered/preferred port first, then fall back to any free port in
+        // the reserved range. Ports are a shared resource: another process (or a previous
+        // run that has not released the socket yet) may already own the preferred one.
+        foreach (int port in CandidatePorts(interfaceIndex, preferredPort))
         {
-            port = preferredPort.Value;
-        }
-        else if (_portAssignments.TryGetValue(interfaceIndex, out int savedPort))
-        {
-            port = savedPort;
-        }
-        else
-        {
-            port = _nextPort++;
+            var candidate = new Socks5Proxy(interfaceIndex, interfaceName, port);
+            if (candidate.Start())
+            {
+                _proxiesByInterfaceIndex[interfaceIndex] = candidate;
+                _portAssignments[interfaceIndex] = port;
+                _nextPort = port + 1;
+
+                if (preferredPort.HasValue && preferredPort.Value != port)
+                {
+                    Console.WriteLine($"[Socks5ProxyManager] Port {preferredPort.Value} was unavailable; " +
+                                      $"interface '{interfaceName}' uses {port} instead.");
+                }
+
+                return candidate;
+            }
+
+            candidate.Dispose();
         }
 
-        var proxy = new Socks5Proxy(interfaceIndex, interfaceName, port);
-        if (proxy.Start())
-        {
-            _proxiesByInterfaceIndex[interfaceIndex] = proxy;
-            _portAssignments[interfaceIndex] = port;
-            return proxy;
-        }
-
+        Console.WriteLine($"[Socks5ProxyManager] No free port in {BasePort}-{BasePort + MaxProxies - 1} " +
+                          $"for interface '{interfaceName}' (index {interfaceIndex}).");
         return null;
+    }
+
+    /// <summary>
+    /// Ports to attempt, in order: explicitly preferred, then the remembered assignment,
+    /// then the reserved range starting after the last handed-out port.
+    /// </summary>
+    private IEnumerable<int> CandidatePorts(int interfaceIndex, int? preferredPort)
+    {
+        var tried = new HashSet<int>();
+
+        if (preferredPort is >= BasePort && preferredPort < BasePort + MaxProxies &&
+            tried.Add(preferredPort.Value))
+        {
+            yield return preferredPort.Value;
+        }
+
+        if (_portAssignments.TryGetValue(interfaceIndex, out int savedPort) && tried.Add(savedPort))
+        {
+            yield return savedPort;
+        }
+
+        int start = _nextPort;
+
+        // Walk the reserved range once, wrapping back to the base port.
+        for (int offset = 0; offset < MaxProxies; offset++)
+        {
+            int port = BasePort + ((start - BasePort + offset) % MaxProxies);
+            if (tried.Add(port))
+            {
+                yield return port;
+            }
+        }
     }
 
     /// <summary>Stops the proxy for the specified interface.</summary>

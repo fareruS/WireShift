@@ -41,7 +41,7 @@ public class TransparentProxy : IDisposable
     }
 
     /// <summary>
-    /// Starts the transparent proxy listener on a dynamic port on all interfaces.
+    /// Starts the transparent proxy listener on a dynamic loopback port.
     /// </summary>
     public bool Start()
     {
@@ -54,10 +54,10 @@ public class TransparentProxy : IDisposable
                 _cts = new CancellationTokenSource();
                 _listenSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 
-                // Bind to a dynamic port on ALL interfaces (0.0.0.0)
-                // This is critical: WinDivert redirects packets to the client's own IP,
-                // not to 127.0.0.1, so we must listen on all interfaces.
-                _listenSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
+                // RedirectorService rewrites captured connections to 127.0.0.1,
+                // so keep the relay listener on loopback rather than exposing it to
+                // other machines on the LAN.
+                _listenSocket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
                 _listenSocket.Listen(100);
 
                 var localEp = (IPEndPoint)_listenSocket.LocalEndPoint!;

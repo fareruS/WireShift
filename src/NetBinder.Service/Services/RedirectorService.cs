@@ -38,6 +38,7 @@ public class RedirectorService : IDisposable
     private Thread? _divertThread;
     private bool _isRunning;
     private int _proxyPort;
+    private long _sendFailureCount;
 
     /// <summary>
     /// NAT table entry: stores everything needed for bidirectional packet rewriting.
@@ -307,7 +308,7 @@ public class RedirectorService : IDisposable
 
         if (ipVersion != 4)
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -322,7 +323,7 @@ public class RedirectorService : IDisposable
 
         if (ipProto != 6) // Not TCP
         {
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -334,46 +335,11 @@ public class RedirectorService : IDisposable
 
         if (addr.Loopback)
         {
-            // LOOPBACK PACKET: This could be from our proxy replying to the client.
-            // Check if it's from our proxy port and has a NAT entry.
-            if (srcPort == (ushort)_proxyPort && _natTable.TryGetValue(dstPort, out var natEntry))
-            {
-                // REVERSE NAT: Rewrite source to look like original remote server
-                byte[] origIpBytes = natEntry.OriginalDest.Address.GetAddressBytes();
-                packet[12] = origIpBytes[0]; // src IP = original remote IP
-                packet[13] = origIpBytes[1];
-                packet[14] = origIpBytes[2];
-                packet[15] = origIpBytes[3];
-
-                // Restore destination to original client IP
-                byte[] clientIpBytes = natEntry.OriginalClientIp.GetAddressBytes();
-                packet[16] = clientIpBytes[0]; // dst IP = original client IP
-                packet[17] = clientIpBytes[1];
-                packet[18] = clientIpBytes[2];
-                packet[19] = clientIpBytes[3];
-
-                // Rewrite source port to original remote port
-                ushort origPort = (ushort)natEntry.OriginalDest.Port;
-                packet[ipHeaderLen] = (byte)(origPort >> 8);
-                packet[ipHeaderLen + 1] = (byte)(origPort & 0xFF);
-
-                // Restore addr to original physical interface
-                addr.IfIdx = natEntry.OriginalIfIdx;
-                addr.SubIfIdx = natEntry.OriginalSubIfIdx;
-                addr.SetLoopback(false);
-                addr.SetOutbound(false); // Mark as inbound so Windows TCP stack delivers it to the client
-                // Keep as inbound (proxy -> client)
-
-                WinDivertNative.WinDivertHelperCalcChecksums(pPacketBuffer, recvLen, ref addr, 0);
-
-                if ((tcpFlags & (0x01 | 0x04)) != 0)
-                    ScheduleNatCleanup(dstPort);
-
-                Console.WriteLine($"[RedirectorService] Reverse NAT: proxy:{srcPort} -> {natEntry.OriginalDest} for client port {dstPort}");
-            }
+            // LOOPBACK PACKET: normally a reply from our own proxy.
+            TryApplyReverseNat(packet, ipHeaderLen, srcPort, dstPort, tcpFlags, pPacketBuffer, recvLen, ref addr);
 
             // Re-inject (modified or not)
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
             return;
         }
 
@@ -383,7 +349,7 @@ public class RedirectorService : IDisposable
             // Check if dst is 127.x.x.x (skip our own rewritten loopback traffic that leaked)
             if (packet[16] == 127)
             {
-                WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+                SendPacket(pPacketBuffer, recvLen, ref addr);
                 return;
             }
 
@@ -456,12 +422,86 @@ public class RedirectorService : IDisposable
                 }
             }
 
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
         }
         else
         {
-            // Inbound non-loopback: just pass through
-            WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+            // Inbound packet on a physical interface. Normally this is genuine remote
+            // traffic, but a proxy reply can arrive without the loopback flag set â€” if it
+            // carries a live NAT entry, rewrite it or the client connection stalls.
+            TryApplyReverseNat(packet, ipHeaderLen, srcPort, dstPort, tcpFlags, pPacketBuffer, recvLen, ref addr);
+            SendPacket(pPacketBuffer, recvLen, ref addr);
+        }
+    }
+
+    /// <summary>
+    /// Rewrites a packet coming back from the local relay so the client sees it as a
+    /// reply from the original remote endpoint. Safe to call for any packet: it returns
+    /// <c>false</c> and touches nothing when the packet is not from the proxy.
+    /// </summary>
+    private unsafe bool TryApplyReverseNat(
+        byte* packet,
+        int ipHeaderLen,
+        ushort srcPort,
+        ushort dstPort,
+        byte tcpFlags,
+        IntPtr pPacketBuffer,
+        uint recvLen,
+        ref WINDIVERT_ADDRESS addr)
+    {
+        if (srcPort != (ushort)_proxyPort || !_natTable.TryGetValue(dstPort, out var natEntry))
+            return false;
+
+        // REVERSE NAT: Rewrite source to look like the original remote server
+        byte[] origIpBytes = natEntry.OriginalDest.Address.GetAddressBytes();
+        packet[12] = origIpBytes[0];
+        packet[13] = origIpBytes[1];
+        packet[14] = origIpBytes[2];
+        packet[15] = origIpBytes[3];
+
+        // Restore destination to the original client IP
+        byte[] clientIpBytes = natEntry.OriginalClientIp.GetAddressBytes();
+        packet[16] = clientIpBytes[0];
+        packet[17] = clientIpBytes[1];
+        packet[18] = clientIpBytes[2];
+        packet[19] = clientIpBytes[3];
+
+        // Rewrite source port to the original remote port
+        ushort origPort = (ushort)natEntry.OriginalDest.Port;
+        packet[ipHeaderLen] = (byte)(origPort >> 8);
+        packet[ipHeaderLen + 1] = (byte)(origPort & 0xFF);
+
+        // Restore the original physical interface so the stack delivers to the client
+        addr.IfIdx = natEntry.OriginalIfIdx;
+        addr.SubIfIdx = natEntry.OriginalSubIfIdx;
+        addr.SetLoopback(false);
+        addr.SetOutbound(false);
+
+        WinDivertNative.WinDivertHelperCalcChecksums(pPacketBuffer, recvLen, ref addr, 0);
+
+        if ((tcpFlags & (0x01 | 0x04)) != 0)
+            ScheduleNatCleanup(dstPort);
+
+        Console.WriteLine($"[RedirectorService] Reverse NAT: proxy:{srcPort} -> {natEntry.OriginalDest} for client port {dstPort}");
+        return true;
+    }
+
+    /// <summary>
+    /// Injects a packet back into the network stack, reporting injection failures.
+    /// A dropped reinjection silently stalls the affected connection, so at least make
+    /// it visible â€” but throttle the log so a storm cannot flood the service.
+    /// </summary>
+    private void SendPacket(IntPtr pPacketBuffer, uint recvLen, ref WINDIVERT_ADDRESS addr)
+    {
+        if (WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr))
+            return;
+
+        int error = Marshal.GetLastWin32Error();
+        long failures = Interlocked.Increment(ref _sendFailureCount);
+        if (failures == 1 || failures % 100 == 0)
+        {
+            Console.WriteLine($"[RedirectorService] WinDivertSend failed (error {error}); " +
+                              $"dropped {failures} packet(s) so far.");
         }
     }
 
@@ -503,7 +543,7 @@ public class RedirectorService : IDisposable
             }
         }
 
-        WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+        SendPacket(pPacketBuffer, recvLen, ref addr);
     }
 
     private unsafe void HandleUdp(byte* packet, uint recvLen, IntPtr pPacketBuffer, ref WINDIVERT_ADDRESS addr)
@@ -524,7 +564,7 @@ public class RedirectorService : IDisposable
                 }
             }
         }
-        WinDivertNative.WinDivertSend(_divertHandle, pPacketBuffer, recvLen, out _, ref addr);
+        SendPacket(pPacketBuffer, recvLen, ref addr);
     }
 
     private void ScheduleNatCleanup(ushort localPort)
@@ -559,21 +599,17 @@ public class RedirectorService : IDisposable
     {
         if (string.IsNullOrEmpty(exePath)) return null;
 
-        string exeName = Path.GetFileName(exePath);
-        string nameWithoutExt = Path.GetFileNameWithoutExtension(exePath);
-
         lock (_bindingsLock)
         {
             foreach (var binding in _activeBindings)
             {
-                if (binding.ExecutablePath.Equals(exePath, StringComparison.OrdinalIgnoreCase) ||
-                    binding.ProcessName.Equals(exeName, StringComparison.OrdinalIgnoreCase) ||
-                    binding.ProcessName.Equals(nameWithoutExt, StringComparison.OrdinalIgnoreCase))
+                // Bindings are tied to an executable path, not a display name. Matching
+                // by process name can accidentally route a different binary with the
+                // same filename (for example a portable or malicious copy).
+                if (binding.ExecutablePath.Equals(exePath, StringComparison.OrdinalIgnoreCase) &&
+                    binding.RoutingMethod == RoutingMethod.Transparent)
                 {
-                    if (binding.RoutingMethod == RoutingMethod.Transparent)
-                    {
-                        return binding.InterfaceIndex;
-                    }
+                    return binding.InterfaceIndex;
                 }
             }
         }
